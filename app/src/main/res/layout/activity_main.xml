@@ -107,7 +107,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Photos will be uploaded under a folder named after this device codename."
+            android:text="Photos and videos upload under a folder named after this device codename. Already-uploaded files are skipped."
             android:textSize="12sp"
             android:textColor="?android:attr/textColorSecondary" />
 

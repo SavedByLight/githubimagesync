@@ -138,8 +138,35 @@ class GitHubClient(
                     obj.get("sha")?.asString
                 }
                 404 -> null
-                else -> throw IOException("getFileSha failed (${response.code})")
+                401, 403 -> {
+                    val body = response.body?.string().orEmpty()
+                    throw IOException(
+                        "Auth failed (${response.code}). Check your token, scopes, and that " +
+                        "owner/repo are correct. GitHub said: ${body.take(200)}"
+                    )
+                }
+                else -> {
+                    val body = response.body?.string().orEmpty()
+                    throw IOException("getFileSha failed (${response.code}): ${body.take(200)}")
+                }
+            }
+        }
+    }
+
+    /** Quick connectivity / auth check against the repo root. */
+    suspend fun testAuth(): String = withContext(Dispatchers.IO) {
+        val url = "https://api.github.com/repos/$owner/$repo"
+        val request = authRequestBuilder(url).get().build()
+        client.newCall(request).execute().use { response ->
+            val body = response.body?.string().orEmpty()
+            when (response.code) {
+                200 -> "OK – authenticated to $owner/$repo"
+                401 -> "401 Unauthorized – token is invalid, expired, or missing. Create a new PAT."
+                403 -> "403 Forbidden – token lacks permission for this repo. Need Contents: Read and write."
+                404 -> "404 Not Found – wrong owner/repo, or token cannot see a private repo."
+                else -> "Unexpected ${response.code}: ${body.take(200)}"
             }
         }
     }
 }
+

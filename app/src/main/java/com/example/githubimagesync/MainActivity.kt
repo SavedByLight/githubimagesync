@@ -74,7 +74,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun ensureStoragePermission(): Boolean {
         val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(Manifest.permission.READ_MEDIA_IMAGES)
+            arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO
+            )
         } else {
             arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
@@ -133,13 +136,16 @@ class MainActivity : AppCompatActivity() {
         appendLog("── Sync (Download) started ──")
         lifecycleScope.launch {
             try {
-                val (ok, fail) = imageRepo.syncDownload(client) { msg ->
+                val result = imageRepo.syncDownload(client) { msg ->
                     appendLog(msg)
                 }
-                appendLog("Sync finished: $ok downloaded, $fail failed")
+                appendLog(
+                    "Sync finished: ${result.success} downloaded, " +
+                        "${result.skipped} skipped, ${result.failed} failed"
+                )
                 Toast.makeText(
                     this@MainActivity,
-                    "Downloaded $ok image(s)",
+                    "Downloaded ${result.success} · skipped ${result.skipped}",
                     Toast.LENGTH_SHORT
                 ).show()
             } catch (e: Exception) {
@@ -159,13 +165,16 @@ class MainActivity : AppCompatActivity() {
         appendLog("── Upload started ──")
         lifecycleScope.launch {
             try {
-                val (ok, fail) = imageRepo.uploadAll(client) { msg ->
+                val result = imageRepo.uploadAll(client) { msg ->
                     appendLog(msg)
                 }
-                appendLog("Upload finished: $ok uploaded, $fail failed")
+                appendLog(
+                    "Upload finished: ${result.success} uploaded, " +
+                        "${result.skipped} skipped, ${result.failed} failed"
+                )
                 Toast.makeText(
                     this@MainActivity,
-                    "Uploaded $ok image(s)",
+                    "Uploaded ${result.success} · skipped ${result.skipped}",
                     Toast.LENGTH_SHORT
                 ).show()
             } catch (e: Exception) {

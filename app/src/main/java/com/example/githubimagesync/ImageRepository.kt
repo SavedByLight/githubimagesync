@@ -18,17 +18,27 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-data class LocalImage(
+data class LocalMedia(
     val id: Long,
     val displayName: String,
     val uri: Uri,
     val size: Long,
-    val dateAdded: Long
+    val dateAdded: Long,
+    val isVideo: Boolean
+)
+
+data class SyncResult(
+    val success: Int,
+    val skipped: Int,
+    val failed: Int
 )
 
 class ImageRepository(private val context: Context) {
 
     private val tag = "ImageRepository"
+
+    /** Max file size for Contents API uploads (GitHub hard limit is 100 MB). */
+    private val maxUploadBytes = 90L * 1024 * 1024
 
     /** Device industrial design / codename, e.g. "raven", "cheetah", "pixel7" */
     fun deviceCodename(): String {
@@ -39,23 +49,42 @@ class ImageRepository(private val context: Context) {
     }
 
     /**
-     * Query all images from the device MediaStore (requires READ_MEDIA_IMAGES / READ_EXTERNAL_STORAGE).
+     * Query all images and videos from MediaStore.
      */
-    suspend fun loadLocalImages(): List<LocalImage> = withContext(Dispatchers.IO) {
-        val images = mutableListOf<LocalImage>()
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+    suspend fun loadLocalMedia(): List<LocalMedia> = withContext(Dispatchers.IO) {
+        val media = mutableListOf<LocalMedia>()
+        media += queryMediaStore(images = true)
+        media += queryMediaStore(images = false)
+        // Newest first
+        media.sortedByDescending { it.dateAdded }
+    }
+
+    private fun queryMediaStore(images: Boolean): List<LocalMedia> {
+        val collection = if (images) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            }
         } else {
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL)
+            } else {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            }
         }
 
-        val projection = arrayOf(
-            MediaStore.Images.Media._ID,
-            MediaStore.Images.Media.DISPLAY_NAME,
-            MediaStore.Images.Media.SIZE,
-            MediaStore.Images.Media.DATE_ADDED
-        )
-        val sortOrder = "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        val idColName = if (images) MediaStore.Images.Media._ID else MediaStore.Video.Media._ID
+        val nameColName =
+            if (images) MediaStore.Images.Media.DISPLAY_NAME else MediaStore.Video.Media.DISPLAY_NAME
+        val sizeColName =
+            if (images) MediaStore.Images.Media.SIZE else MediaStore.Video.Media.SIZE
+        val dateColName =
+            if (images) MediaStore.Images.Media.DATE_ADDED else MediaStore.Video.Media.DATE_ADDED
+
+        val projection = arrayOf(idColName, nameColName, sizeColName, dateColName)
+        val sortOrder = "$dateColName DESC"
+        val result = mutableListOf<LocalMedia>()
 
         context.contentResolver.query(
             collection,
@@ -64,55 +93,70 @@ class ImageRepository(private val context: Context) {
             null,
             sortOrder
         )?.use { cursor ->
-            val idCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-            val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
-            val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.SIZE)
-            val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Images.Media.DATE_ADDED)
+            val idCol = cursor.getColumnIndexOrThrow(idColName)
+            val nameCol = cursor.getColumnIndexOrThrow(nameColName)
+            val sizeCol = cursor.getColumnIndexOrThrow(sizeColName)
+            val dateCol = cursor.getColumnIndexOrThrow(dateColName)
 
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(idCol)
-                val name = cursor.getString(nameCol) ?: "image_$id.jpg"
+                val name = cursor.getString(nameCol)
+                    ?: if (images) "image_$id.jpg" else "video_$id.mp4"
                 val size = cursor.getLong(sizeCol)
                 val date = cursor.getLong(dateCol)
                 val contentUri = ContentUris.withAppendedId(collection, id)
-                images.add(LocalImage(id, name, contentUri, size, date))
+                result.add(LocalMedia(id, name, contentUri, size, date, isVideo = !images))
             }
         }
-        images
+        return result
     }
 
-    /**
-     * Read the raw bytes of a MediaStore image.
-     */
-    suspend fun readImageBytes(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
+    suspend fun readMediaBytes(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
         context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
             ?: throw IllegalStateException("Cannot open $uri")
     }
 
     /**
-     * Save downloaded image bytes into the public Pictures/GitHubSync/<codename>/ folder
-     * so they appear in the Gallery.
+     * Save downloaded media into Pictures or Movies under GitHubSync/<codename>/.
      */
-    suspend fun saveImageToGallery(
+    suspend fun saveMediaToGallery(
         fileName: String,
         bytes: ByteArray,
-        subFolder: String
+        subFolder: String,
+        isVideo: Boolean
     ): Uri? = withContext(Dispatchers.IO) {
-        val relativePath = "${Environment.DIRECTORY_PICTURES}/GitHubSync/$subFolder"
+        val baseDir = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
+        val relativePath = "$baseDir/GitHubSync/$subFolder"
+        val mime = guessMime(fileName, isVideo)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Images.Media.MIME_TYPE, guessMime(fileName))
-                put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
-                put(MediaStore.Images.Media.IS_PENDING, 1)
+            val collection = if (isVideo) {
+                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            } else {
+                MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             }
-            val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val values = ContentValues().apply {
+                if (isVideo) {
+                    put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Video.Media.MIME_TYPE, mime)
+                    put(MediaStore.Video.Media.RELATIVE_PATH, relativePath)
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                } else {
+                    put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                    put(MediaStore.Images.Media.MIME_TYPE, mime)
+                    put(MediaStore.Images.Media.RELATIVE_PATH, relativePath)
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
             val uri = context.contentResolver.insert(collection, values) ?: return@withContext null
             try {
                 context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
                 values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                if (isVideo) {
+                    values.put(MediaStore.Video.Media.IS_PENDING, 0)
+                } else {
+                    values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                }
                 context.contentResolver.update(uri, values, null, null)
                 uri
             } catch (e: Exception) {
@@ -122,109 +166,168 @@ class ImageRepository(private val context: Context) {
         } else {
             @Suppress("DEPRECATION")
             val dir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
+                Environment.getExternalStoragePublicDirectory(baseDir),
                 "GitHubSync/$subFolder"
             )
             if (!dir.exists()) dir.mkdirs()
             val file = File(dir, fileName)
             FileOutputStream(file).use { it.write(bytes) }
-            // Notify MediaStore
             val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DATA, file.absolutePath)
-                put(MediaStore.Images.Media.MIME_TYPE, guessMime(fileName))
+                if (isVideo) {
+                    put(MediaStore.Video.Media.DATA, file.absolutePath)
+                    put(MediaStore.Video.Media.MIME_TYPE, mime)
+                } else {
+                    put(MediaStore.Images.Media.DATA, file.absolutePath)
+                    put(MediaStore.Images.Media.MIME_TYPE, mime)
+                }
             }
-            context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            val collection = if (isVideo) {
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+            } else {
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+            }
+            context.contentResolver.insert(collection, values)
         }
     }
 
-    private fun guessMime(name: String): String = when {
-        name.endsWith(".png", true) -> "image/png"
-        name.endsWith(".webp", true) -> "image/webp"
-        name.endsWith(".gif", true) -> "image/gif"
-        name.endsWith(".heic", true) || name.endsWith(".heif", true) -> "image/heif"
-        else -> "image/jpeg"
+    private fun guessMime(name: String, isVideo: Boolean): String {
+        val lower = name.lowercase(Locale.US)
+        return when {
+            lower.endsWith(".png") -> "image/png"
+            lower.endsWith(".webp") -> "image/webp"
+            lower.endsWith(".gif") -> "image/gif"
+            lower.endsWith(".heic") || lower.endsWith(".heif") -> "image/heif"
+            lower.endsWith(".bmp") -> "image/bmp"
+            lower.endsWith(".mp4") -> "video/mp4"
+            lower.endsWith(".mkv") -> "video/x-matroska"
+            lower.endsWith(".webm") -> "video/webm"
+            lower.endsWith(".3gp") -> "video/3gpp"
+            lower.endsWith(".mov") -> "video/quicktime"
+            lower.endsWith(".avi") -> "video/x-msvideo"
+            isVideo -> "video/mp4"
+            else -> "image/jpeg"
+        }
     }
 
     // ─── High-level sync operations ───────────────────────────────────────────
 
     /**
-     * Upload all local images into the GitHub folder named after the device codename.
-     * Existing files with the same name are overwritten (SHA is fetched first).
+     * Upload local images & videos into the GitHub folder named after the device codename.
+     * Files that already exist on GitHub (same name) are skipped.
      */
     suspend fun uploadAll(
         client: GitHubClient,
         onProgress: (String) -> Unit
-    ): Pair<Int, Int> {
+    ): SyncResult {
         val codename = deviceCodename()
-        val folder = codename // e.g. "raven"
-        val images = loadLocalImages()
-        onProgress("Found ${images.size} local image(s). Uploading to /$folder …")
+        val folder = codename
+        val media = loadLocalMedia()
+        val images = media.count { !it.isVideo }
+        val videos = media.count { it.isVideo }
+        onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
+
+        // One list call instead of getFileSha per file (faster + fewer rate limits)
+        val remoteNames = try {
+            client.listDirectory(folder)
+                .filter { it.type == "file" }
+                .map { it.name }
+                .toSet()
+        } catch (e: Exception) {
+            onProgress("Could not list remote folder: ${e.message}")
+            emptySet()
+        }
+        onProgress("${remoteNames.size} file(s) already on GitHub – those will be skipped")
 
         var success = 0
+        var skipped = 0
         var failed = 0
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
 
-        for ((index, image) in images.withIndex()) {
+        for ((index, item) in media.withIndex()) {
+            val kind = if (item.isVideo) "video" else "image"
             try {
-                onProgress("[${index + 1}/${images.size}] Uploading ${image.displayName} …")
-                val bytes = readImageBytes(image.uri)
-                // Skip empty or huge files (> 50 MB – GitHub soft limit for Contents API is 100 MB)
+                onProgress("[${index + 1}/${media.size}] ${item.displayName}")
+
+                if (item.displayName in remoteNames) {
+                    skipped++
+                    onProgress("  skipped (already uploaded)")
+                    continue
+                }
+
+                // Prefer MediaStore size when available to avoid reading huge files we will reject
+                if (item.size > 0 && item.size > maxUploadBytes) {
+                    skipped++
+                    onProgress("  skipped (too large > 90 MB)")
+                    continue
+                }
+
+                val bytes = readMediaBytes(item.uri)
                 if (bytes.isEmpty()) {
+                    skipped++
                     onProgress("  skipped (empty)")
                     continue
                 }
-                if (bytes.size > 50 * 1024 * 1024) {
-                    onProgress("  skipped (too large > 50 MB)")
+                if (bytes.size > maxUploadBytes) {
+                    skipped++
+                    onProgress("  skipped (too large > 90 MB)")
                     continue
                 }
 
-                val remotePath = "$folder/${image.displayName}"
-                val existingSha = client.getFileSha(remotePath)
+                val remotePath = "$folder/${item.displayName}"
                 client.uploadFile(
                     path = remotePath,
                     contentBytes = bytes,
-                    commitMessage = "Upload ${image.displayName} from $codename ($timestamp)",
-                    existingSha = existingSha
+                    commitMessage = "Upload ${item.displayName} ($kind) from $codename ($timestamp)",
+                    existingSha = null // new file only – we skip existing names
                 )
                 success++
-                onProgress("  OK")
+                onProgress("  OK ($kind)")
             } catch (e: Exception) {
                 failed++
-                Log.e(tag, "Upload failed for ${image.displayName}", e)
+                Log.e(tag, "Upload failed for ${item.displayName}", e)
                 onProgress("  FAILED: ${e.message}")
             }
         }
-        return success to failed
+        return SyncResult(success, skipped, failed)
     }
 
     /**
-     * Download every file that looks like an image from the device-codename folder
-     * on GitHub and save it into the phone's gallery.
+     * Download images & videos from the device-codename folder on GitHub into the gallery.
+     * Files that already exist locally (same display name in MediaStore) are skipped.
      */
     suspend fun syncDownload(
         client: GitHubClient,
         onProgress: (String) -> Unit
-    ): Pair<Int, Int> {
+    ): SyncResult {
         val codename = deviceCodename()
         onProgress("Listing /$codename on GitHub …")
         val items: List<ContentItem> = client.listDirectory(codename)
-        val files = items.filter { it.type == "file" && isImageName(it.name) }
+        val files = items.filter { it.type == "file" && isMediaName(it.name) }
 
         if (files.isEmpty()) {
-            onProgress("No image files found in /$codename")
-            return 0 to 0
+            onProgress("No media files found in /$codename")
+            return SyncResult(0, 0, 0)
         }
-        onProgress("Found ${files.size} remote image(s). Downloading …")
+        onProgress("Found ${files.size} remote media file(s). Checking local library …")
+
+        val localNames = loadLocalMedia().map { it.displayName }.toSet()
 
         var success = 0
+        var skipped = 0
         var failed = 0
         for ((index, item) in files.withIndex()) {
             try {
                 onProgress("[${index + 1}/${files.size}] ${item.name}")
+                if (item.name in localNames) {
+                    skipped++
+                    onProgress("  skipped (already on device)")
+                    continue
+                }
                 val url = item.downloadUrl
                     ?: throw IllegalStateException("No download_url for ${item.path}")
                 val bytes = client.downloadFile(url)
-                saveImageToGallery(item.name, bytes, codename)
+                val video = isVideoName(item.name)
+                saveMediaToGallery(item.name, bytes, codename, isVideo = video)
                 success++
                 onProgress("  saved")
             } catch (e: Exception) {
@@ -233,7 +336,7 @@ class ImageRepository(private val context: Context) {
                 onProgress("  FAILED: ${e.message}")
             }
         }
-        return success to failed
+        return SyncResult(success, skipped, failed)
     }
 
     private fun isImageName(name: String): Boolean {
@@ -243,4 +346,14 @@ class ImageRepository(private val context: Context) {
                 lower.endsWith(".gif") || lower.endsWith(".heic") ||
                 lower.endsWith(".heif") || lower.endsWith(".bmp")
     }
+
+    private fun isVideoName(name: String): Boolean {
+        val lower = name.lowercase(Locale.US)
+        return lower.endsWith(".mp4") || lower.endsWith(".mkv") ||
+                lower.endsWith(".webm") || lower.endsWith(".3gp") ||
+                lower.endsWith(".mov") || lower.endsWith(".avi") ||
+                lower.endsWith(".m4v")
+    }
+
+    private fun isMediaName(name: String): Boolean = isImageName(name) || isVideoName(name)
 }
