@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">GitHub Image Sync</string>
+    <string name="github_owner_hint">GitHub username / org</string>
+    <string name="github_repo_hint">Repository name</string>
+    <string name="github_token_hint">Personal Access Token (repo scope)</string>
+    <string name="save_settings">Save Settings</string>
+    <string name="sync_button">Sync (Download)</string>
+    <string name="upload_button">Upload</string>
+    <string name="device_codename_label">Device folder:</string>
+    <string name="status_idle">Ready</string>
+    <string name="permission_required">Storage permission is required to access photos</string>
+    <string name="settings_saved">Settings saved</string>
+    <string name="missing_config">Please fill in Owner, Repo and Token</string>
+</resources>
