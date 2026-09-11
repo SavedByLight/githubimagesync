@@ -14,6 +14,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,10 +38,6 @@ class ImageRepository(private val context: Context) {
 
     private val tag = "ImageRepository"
 
-    /** Max file size for Contents API uploads (GitHub hard limit is 100 MB). */
-    private val maxUploadBytes = 90L * 1024 * 1024
-
-    /** Device industrial design / codename, e.g. "raven", "cheetah", "pixel7" */
     fun deviceCodename(): String {
         val device = Build.DEVICE
         return if (device.isNullOrBlank()) "unknown_device" else device
@@ -48,14 +45,10 @@ class ImageRepository(private val context: Context) {
             .lowercase(Locale.US)
     }
 
-    /**
-     * Query all images and videos from MediaStore.
-     */
     suspend fun loadLocalMedia(): List<LocalMedia> = withContext(Dispatchers.IO) {
         val media = mutableListOf<LocalMedia>()
         media += queryMediaStore(images = true)
         media += queryMediaStore(images = false)
-        // Newest first
         media.sortedByDescending { it.dateAdded }
     }
 
@@ -111,14 +104,14 @@ class ImageRepository(private val context: Context) {
         return result
     }
 
-    suspend fun readMediaBytes(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
-        context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+    private fun openMediaStream(uri: Uri): InputStream =
+        context.contentResolver.openInputStream(uri)
             ?: throw IllegalStateException("Cannot open $uri")
+
+    suspend fun readMediaBytes(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
+        openMediaStream(uri).use { it.readBytes() }
     }
 
-    /**
-     * Save downloaded media into Pictures or Movies under GitHubSync/<codename>/.
-     */
     suspend fun saveMediaToGallery(
         fileName: String,
         bytes: ByteArray,
@@ -209,12 +202,6 @@ class ImageRepository(private val context: Context) {
         }
     }
 
-    // ─── High-level sync operations ───────────────────────────────────────────
-
-    /**
-     * Upload local images & videos into the GitHub folder named after the device codename.
-     * Files that already exist on GitHub (same name) are skipped.
-     */
     suspend fun uploadAll(
         client: GitHubClient,
         onProgress: (String) -> Unit
@@ -226,7 +213,6 @@ class ImageRepository(private val context: Context) {
         val videos = media.count { it.isVideo }
         onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
 
-        // One list call instead of getFileSha per file (faster + fewer rate limits)
         val remoteNames = try {
             client.listDirectory(folder)
                 .filter { it.type == "file" }
@@ -242,6 +228,7 @@ class ImageRepository(private val context: Context) {
         var skipped = 0
         var failed = 0
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
+        var lfsReady = false
 
         for ((index, item) in media.withIndex()) {
             val kind = if (item.isVideo) "video" else "image"
@@ -254,32 +241,53 @@ class ImageRepository(private val context: Context) {
                     continue
                 }
 
-                // Prefer MediaStore size when available to avoid reading huge files we will reject
-                if (item.size > 0 && item.size > maxUploadBytes) {
-                    skipped++
-                    onProgress("  skipped (too large > 90 MB)")
-                    continue
+                val size = if (item.size > 0) item.size else {
+                    openMediaStream(item.uri).use { stream ->
+                        var total = 0L
+                        val buf = ByteArray(64 * 1024)
+                        while (true) {
+                            val n = stream.read(buf)
+                            if (n < 0) break
+                            total += n
+                        }
+                        total
+                    }
                 }
 
-                val bytes = readMediaBytes(item.uri)
-                if (bytes.isEmpty()) {
+                if (size <= 0L) {
                     skipped++
                     onProgress("  skipped (empty)")
                     continue
                 }
-                if (bytes.size > maxUploadBytes) {
-                    skipped++
-                    onProgress("  skipped (too large > 90 MB)")
-                    continue
-                }
 
                 val remotePath = "$folder/${item.displayName}"
-                client.uploadFile(
-                    path = remotePath,
-                    contentBytes = bytes,
-                    commitMessage = "Upload ${item.displayName} ($kind) from $codename ($timestamp)",
-                    existingSha = null // new file only – we skip existing names
-                )
+                val message = "Upload ${item.displayName} ($kind) from $codename ($timestamp)"
+
+                if (size >= GitHubClient.CONTENTS_MAX_BYTES) {
+                    if (!lfsReady) {
+                        onProgress("  ensuring .gitattributes (LFS) …")
+                        client.ensureLfsAttributes()
+                        lfsReady = true
+                    }
+                    val mb = size / (1024.0 * 1024.0)
+                    onProgress("  using Git LFS (%.1f MB)".format(mb))
+                    client.uploadLargeFile(
+                        path = remotePath,
+                        sizeBytes = size,
+                        openStream = { openMediaStream(item.uri) },
+                        commitMessage = "$message [LFS]",
+                        onProgress = onProgress
+                    )
+                } else {
+                    onProgress("  uploading via Contents API (${size / 1024} KB) …")
+                    val bytes = readMediaBytes(item.uri)
+                    client.uploadFile(
+                        path = remotePath,
+                        contentBytes = bytes,
+                        commitMessage = message,
+                        existingSha = null
+                    )
+                }
                 success++
                 onProgress("  OK ($kind)")
             } catch (e: Exception) {
@@ -291,10 +299,6 @@ class ImageRepository(private val context: Context) {
         return SyncResult(success, skipped, failed)
     }
 
-    /**
-     * Download images & videos from the device-codename folder on GitHub into the gallery.
-     * Files that already exist locally (same display name in MediaStore) are skipped.
-     */
     suspend fun syncDownload(
         client: GitHubClient,
         onProgress: (String) -> Unit
@@ -325,11 +329,11 @@ class ImageRepository(private val context: Context) {
                 }
                 val url = item.downloadUrl
                     ?: throw IllegalStateException("No download_url for ${item.path}")
-                val bytes = client.downloadFile(url)
+                val bytes = client.downloadMedia(url, onProgress)
                 val video = isVideoName(item.name)
                 saveMediaToGallery(item.name, bytes, codename, isVideo = video)
                 success++
-                onProgress("  saved")
+                onProgress("  saved (${bytes.size / 1024} KB)")
             } catch (e: Exception) {
                 failed++
                 Log.e(tag, "Download failed for ${item.name}", e)
