@@ -217,16 +217,21 @@ class ImageRepository(private val context: Context) {
         onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
         if (encrypt) onProgress("Encryption is ON (AES-256-CTR + HMAC)")
 
-        val remoteNames = try {
-            client.listDirectory(folder)
+        // Mutable so we can add names as we upload (avoids re-uploading in the same run)
+        val remoteNames = mutableSetOf<String>()
+        try {
+            val listed = client.listDirectory(folder)
                 .filter { it.type == "file" }
                 .map { it.name }
-                .toSet()
+            remoteNames.addAll(listed)
+            onProgress("${remoteNames.size} file(s) already on GitHub – those will be skipped")
+            if (listed.size >= 1000) {
+                onProgress("  (directory listing may be truncated at 1000; will verify each file individually)")
+            }
         } catch (e: Exception) {
             onProgress("Could not list remote folder: ${e.message}")
-            emptySet()
+            onProgress("  Will check each file individually before upload")
         }
-        onProgress("${remoteNames.size} file(s) already on GitHub – those will be skipped")
 
         var success = 0
         var skipped = 0
@@ -240,7 +245,23 @@ class ImageRepository(private val context: Context) {
             try {
                 onProgress("[${index + 1}/${media.size}] ${item.displayName}")
 
-                if (item.displayName in remoteNames) {
+                val remotePath = "$folder/${item.displayName}"
+
+                // Fast path: name was in the directory listing
+                var alreadyRemote = item.displayName in remoteNames
+                // Reliable path: if not listed (truncated / list failed), ask GitHub for this path
+                if (!alreadyRemote) {
+                    try {
+                        if (client.getFileSha(remotePath) != null) {
+                            alreadyRemote = true
+                            remoteNames.add(item.displayName)
+                        }
+                    } catch (e: Exception) {
+                        // Auth / network errors should not silently re-upload; surface them
+                        throw e
+                    }
+                }
+                if (alreadyRemote) {
                     skipped++
                     onProgress("  skipped (already uploaded)")
                     continue
@@ -265,7 +286,6 @@ class ImageRepository(private val context: Context) {
                     continue
                 }
 
-                val remotePath = "$folder/${item.displayName}"
                 val message = "Upload ${item.displayName} ($kind) from $codename ($timestamp)" +
                     if (encrypt) " [encrypted]" else ""
 
@@ -336,11 +356,23 @@ class ImageRepository(private val context: Context) {
                     }
                 }
                 success++
+                remoteNames.add(item.displayName)
                 onProgress("  OK ($kind)")
             } catch (e: Exception) {
-                failed++
-                Log.e(tag, "Upload failed for ${item.displayName}", e)
-                onProgress("  FAILED: ${e.message}")
+                // If GitHub says the file already exists (race / truncated list), count as skipped
+                val msg = e.message.orEmpty()
+                if (msg.contains("sha wasn't supplied", ignoreCase = true) ||
+                    msg.contains("already exists", ignoreCase = true) ||
+                    msg.contains("422", ignoreCase = true)
+                ) {
+                    skipped++
+                    remoteNames.add(item.displayName)
+                    onProgress("  skipped (already on GitHub)")
+                } else {
+                    failed++
+                    Log.e(tag, "Upload failed for ${item.displayName}", e)
+                    onProgress("  FAILED: ${e.message}")
+                }
             }
         }
         return SyncResult(success, skipped, failed)
