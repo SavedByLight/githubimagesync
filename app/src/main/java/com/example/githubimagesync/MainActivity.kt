@@ -1,6 +1,10 @@
 package com.example.githubimagesync
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -24,10 +28,28 @@ class MainActivity : AppCompatActivity() {
     ) { results ->
         val granted = results.values.all { it }
         if (granted) {
-            appendLog("Storage permission granted")
+            appendLog("Permissions granted")
         } else {
             Toast.makeText(this, R.string.permission_required, Toast.LENGTH_LONG).show()
-            appendLog("Storage permission denied")
+            appendLog("Permission denied")
+        }
+    }
+
+    /** Receives progress / status messages from [UploadForegroundService]. */
+    private val statusReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val msg = intent?.getStringExtra(UploadForegroundService.EXTRA_MESSAGE) ?: return
+            appendLog(msg)
+            // When the service reports a terminal status, clear the busy UI
+            if (msg.startsWith("Upload finished") ||
+                msg.startsWith("ERROR:") ||
+                msg == "Upload cancelled"
+            ) {
+                setBusy(false)
+                if (msg.startsWith("Upload finished")) {
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
@@ -53,8 +75,32 @@ class MainActivity : AppCompatActivity() {
         binding.btnSync.setOnClickListener { startSyncDownload() }
         binding.btnUpload.setOnClickListener { startUpload() }
 
+        // Reflect any upload that is already running (e.g. user reopened the app)
+        if (UploadForegroundService.isRunning) {
+            setBusy(true)
+            appendLog("Upload already running in background…")
+        }
+
         // Request permission early
         ensureStoragePermission()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter(UploadForegroundService.ACTION_STATUS)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(statusReceiver, filter)
+        }
+        // Re-sync busy state in case service finished while we were stopped
+        setBusy(UploadForegroundService.isRunning)
+    }
+
+    override fun onStop() {
+        unregisterReceiver(statusReceiver)
+        super.onStop()
     }
 
     private fun saveSettings() {
@@ -77,13 +123,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensureStoragePermission(): Boolean {
-        val permissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            arrayOf(
-                Manifest.permission.READ_MEDIA_IMAGES,
-                Manifest.permission.READ_MEDIA_VIDEO
-            )
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions += Manifest.permission.READ_MEDIA_IMAGES
+            permissions += Manifest.permission.READ_MEDIA_VIDEO
+            // Needed for the upload progress notification
+            permissions += Manifest.permission.POST_NOTIFICATIONS
         } else {
-            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+            permissions += Manifest.permission.READ_EXTERNAL_STORAGE
         }
 
         val missing = permissions.filter {
@@ -135,6 +182,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSyncDownload() {
+        if (UploadForegroundService.isRunning) {
+            Toast.makeText(this, "Upload is running in background – wait or stop it first", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!ensureStoragePermission()) return
         val client = requireConfig() ?: return
 
@@ -166,35 +217,24 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Starts a foreground service that keeps uploading even after the user
+     * leaves the app or swipes it away. Progress appears in a notification
+     * and is also broadcast back to this activity when it is open.
+     */
     private fun startUpload() {
+        if (UploadForegroundService.isRunning) {
+            Toast.makeText(this, "Upload already running in background", Toast.LENGTH_SHORT).show()
+            return
+        }
         if (!ensureStoragePermission()) return
-        val client = requireConfig() ?: return
+        // Validate & persist settings before handing off to the service
+        if (requireConfig() == null) return
 
         setBusy(true)
-        appendLog("── Upload started ──")
-        lifecycleScope.launch {
-            try {
-                val result = imageRepo.uploadAll(
-                    client,
-                    encryptionPassword = prefs.encryptionPassword
-                ) { msg ->
-                    appendLog(msg)
-                }
-                appendLog(
-                    "Upload finished: ${result.success} uploaded, " +
-                        "${result.skipped} skipped, ${result.failed} failed"
-                )
-                Toast.makeText(
-                    this@MainActivity,
-                    "Uploaded ${result.success} · skipped ${result.skipped}",
-                    Toast.LENGTH_SHORT
-                ).show()
-            } catch (e: Exception) {
-                appendLog("ERROR: ${e.message}")
-                Toast.makeText(this@MainActivity, "Upload failed: ${e.message}", Toast.LENGTH_LONG).show()
-            } finally {
-                setBusy(false)
-            }
-        }
+        appendLog("── Upload started (background) ──")
+        appendLog("You can close the app – upload will continue.")
+        Toast.makeText(this, "Upload running in background", Toast.LENGTH_SHORT).show()
+        UploadForegroundService.start(this)
     }
 }
