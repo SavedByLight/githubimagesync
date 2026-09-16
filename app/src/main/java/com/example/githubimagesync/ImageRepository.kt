@@ -215,7 +215,7 @@ class ImageRepository(private val context: Context) {
         val videos = media.count { it.isVideo }
         val encrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
         onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
-        if (encrypt) onProgress("Encryption is ON (AES-256-GCM)")
+        if (encrypt) onProgress("Encryption is ON (AES-256-CTR + HMAC)")
 
         val remoteNames = try {
             client.listDirectory(folder)
@@ -354,7 +354,7 @@ class ImageRepository(private val context: Context) {
         val codename = deviceCodename()
         val decrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
         onProgress("Listing /$codename on GitHub …")
-        if (decrypt) onProgress("Decryption is ON (AES-256-GCM)")
+        if (decrypt) onProgress("Decryption is ON (AES-256-CTR + HMAC)")
         val items: List<ContentItem> = client.listDirectory(codename)
         val files = items.filter { it.type == "file" && isMediaName(it.name) }
 
