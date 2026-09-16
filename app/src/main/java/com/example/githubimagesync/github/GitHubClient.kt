@@ -117,7 +117,9 @@ class GitHubClient(
 
     /**
      * Creates or updates a small file via the Contents API (base64 body).
-     * Must be under ~100 MB (GitHub hard limit).
+     * Keep payloads well under the GitHub 100 MB hard limit: base64 expands
+     * size by ~4/3 and Android heaps are often only 256 MB, so large files
+     * must use [uploadLargeFile] (Git LFS) instead.
      */
     suspend fun uploadFile(
         path: String,
@@ -127,7 +129,8 @@ class GitHubClient(
     ): CreateOrUpdateFileResponse = withContext(Dispatchers.IO) {
         if (contentBytes.size.toLong() > CONTENTS_MAX_BYTES) {
             throw IOException(
-                "File is ${contentBytes.size} bytes – use uploadLargeFile (Git LFS) for ≥100 MB"
+                "File is ${contentBytes.size} bytes – use uploadLargeFile (Git LFS) " +
+                    "for files larger than ${CONTENTS_MAX_BYTES / (1024 * 1024)} MB"
             )
         }
         val base64 = Base64.encodeToString(contentBytes, Base64.NO_WRAP)
@@ -429,8 +432,14 @@ class GitHubClient(
     }
 
     companion object {
-        /** GitHub Contents API hard limit is 100 MB. */
-        const val CONTENTS_MAX_BYTES: Long = 100L * 1024 * 1024
+        /**
+         * Practical max for Contents API on mobile.
+         * GitHub allows up to 100 MB, but Base64.encodeToString keeps both the
+         * original bytes and the ~4/3-sized string in memory and OOMs on a
+         * typical 256 MB heap for large photos/videos. Route anything larger
+         * through Git LFS ([uploadLargeFile]).
+         */
+        const val CONTENTS_MAX_BYTES: Long = 20L * 1024 * 1024
 
         fun buildLfsPointer(oid: String, size: Long): String =
             "version https://git-lfs.github.com/spec/v1\n" +
