@@ -148,7 +148,7 @@ class ImageRepository(private val context: Context) {
         val relativePath = "$baseDir/GitHubSync/$subFolder"
         val mime = guessMime(fileName, isVideo)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val collection = if (isVideo) {
                 MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             } else {
