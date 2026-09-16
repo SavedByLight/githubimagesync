@@ -111,6 +111,78 @@ object CryptoHelper {
     }
 
     /**
+     * Decrypts [encFile] into [outFile] with constant memory (two sequential passes).
+     * If [password] is blank, copies [encFile] to [outFile] unchanged.
+     */
+    fun decryptToFile(encFile: File, outFile: File, password: String) {
+        if (!isEncryptionEnabled(password)) {
+            encFile.copyTo(outFile, overwrite = true)
+            return
+        }
+        val total = encFile.length()
+        if (total < OVERHEAD_BYTES) {
+            throw IllegalArgumentException("Data too short to be encrypted ($total bytes)")
+        }
+        val cipherTextLen = total - OVERHEAD_BYTES
+
+        val salt = ByteArray(SALT_LEN)
+        val iv = ByteArray(IV_LEN)
+        val tag = ByteArray(HMAC_LEN)
+
+        // Pass 1: read header, verify HMAC over (IV || ciphertext)
+        FileInputStream(encFile).use { fis ->
+            fis.readFully(salt)
+            fis.readFully(iv)
+            val (_, hmacKey) = deriveKeys(password, salt)
+            val mac = Mac.getInstance(HMAC_ALGO)
+            mac.init(hmacKey)
+            mac.update(iv)
+            val buf = ByteArray(64 * 1024)
+            var remaining = cipherTextLen
+            while (remaining > 0) {
+                val n = fis.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                if (n < 0) throw IllegalArgumentException("Unexpected EOF while verifying HMAC")
+                mac.update(buf, 0, n)
+                remaining -= n
+            }
+            fis.readFully(tag)
+            if (!constantTimeEquals(mac.doFinal(), tag)) {
+                throw IllegalArgumentException("HMAC verification failed – wrong password or corrupted data")
+            }
+        }
+
+        // Pass 2: decrypt ciphertext → outFile
+        FileInputStream(encFile).use { fis ->
+            fis.readFully(salt)
+            fis.readFully(iv)
+            val (aesKey, _) = deriveKeys(password, salt)
+            val cipher = Cipher.getInstance(CIPHER_TRANSFORM)
+            cipher.init(Cipher.DECRYPT_MODE, aesKey, IvParameterSpec(iv))
+            FileOutputStream(outFile).use { fos ->
+                CipherOutputStream(fos, cipher).use { cos ->
+                    val buf = ByteArray(64 * 1024)
+                    var remaining = cipherTextLen
+                    while (remaining > 0) {
+                        val n = fis.read(buf, 0, minOf(buf.size.toLong(), remaining).toInt())
+                        if (n < 0) break
+                        cos.write(buf, 0, n)
+                        remaining -= n
+                    }
+                }
+            }
+        }
+    }
+
+    private fun InputStream.readFully(buf: ByteArray) {
+        var off = 0
+        while (off < buf.size) {
+            val n = read(buf, off, buf.size - off)
+            if (n < 0) throw IllegalArgumentException("Unexpected EOF")
+            off += n
+        }
+    }
+
+    /**
      * Encrypts a stream to a temporary file. True streaming – constant memory.
      * Caller must delete the returned file when done.
      * Returns null (and does not create a file) if encryption is disabled.

@@ -15,6 +15,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import okio.BufferedSink
 import okio.source
+import java.io.File
 import java.io.IOException
 import java.io.InputStream
 import java.security.MessageDigest
@@ -112,6 +113,27 @@ class GitHubClient(
                 throw IOException("Download failed (${response.code})")
             }
             response.body?.bytes() ?: throw IOException("Empty body")
+        }
+    }
+
+    /** Streams [downloadUrl] body into [dest]. Avoids loading large bodies into the heap. */
+    private fun downloadFileTo(downloadUrl: String, dest: File) {
+        val request = Request.Builder()
+            .url(downloadUrl)
+            .header("Authorization", "Bearer $token")
+            .header("User-Agent", "GitHubImageSync-Android")
+            .get()
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("Download failed (${response.code})")
+            }
+            val body = response.body ?: throw IOException("Empty body")
+            body.byteStream().use { input ->
+                java.io.FileOutputStream(dest).use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
         }
     }
 
@@ -314,6 +336,7 @@ class GitHubClient(
 
     /**
      * Download file bytes. If the remote content is an LFS pointer, fetches the real object via LFS.
+     * Prefer [downloadMediaToFile] for large media to avoid OOM.
      */
     suspend fun downloadMedia(
         downloadUrl: String,
@@ -337,6 +360,40 @@ class GitHubClient(
         val downloadAction = obj.actions?.download
             ?: throw IOException("LFS: no download action (object missing on server?)")
         getLfsObject(downloadAction)
+    }
+
+    /**
+     * Streams media to [dest]. Handles Git LFS pointers without loading the full object into RAM.
+     * Caller owns [dest] (delete when done).
+     */
+    suspend fun downloadMediaToFile(
+        downloadUrl: String,
+        dest: File,
+        onProgress: ((String) -> Unit)? = null
+    ): Unit = withContext(Dispatchers.IO) {
+        // First response is often a small LFS pointer; stream it to dest then check
+        downloadFileTo(downloadUrl, dest)
+
+        // LFS pointers are tiny text files; only peek if the download is small
+        if (dest.length() in 1..512) {
+            val text = dest.readText(Charsets.UTF_8)
+            val pointer = parseLfsPointer(text)
+            if (pointer != null) {
+                onProgress?.invoke(
+                    "  LFS object ${pointer.first.take(12)}… (${pointer.second} bytes)"
+                )
+                val batch = lfsBatch("download", pointer.first, pointer.second)
+                val obj = batch.objects?.firstOrNull()
+                    ?: throw IOException("LFS batch (download) returned no objects")
+                if (obj.error != null) {
+                    throw IOException("LFS download error: ${obj.error.message}")
+                }
+                val downloadAction = obj.actions?.download
+                    ?: throw IOException("LFS: no download action (object missing on server?)")
+                // Replace pointer file with real object (streamed)
+                getLfsObjectTo(downloadAction, dest)
+            }
+        }
     }
 
     private fun lfsBatch(operation: String, oid: String, size: Long): LfsBatchResponse {
@@ -428,6 +485,27 @@ class GitHubClient(
                 throw IOException("LFS object download failed (${response.code})")
             }
             return response.body?.bytes() ?: throw IOException("Empty LFS body")
+        }
+    }
+
+    /** Streams an LFS object into [dest] (overwrites). Constant memory. */
+    private fun getLfsObjectTo(action: LfsActionLink, dest: File) {
+        val builder = Request.Builder().url(action.href).get()
+        action.header?.forEach { (k, v) -> builder.header(k, v) }
+        if (action.header?.keys?.none { it.equals("Authorization", ignoreCase = true) } != false) {
+            builder.header("Authorization", "Bearer $token")
+        }
+        builder.header("User-Agent", "git-lfs/3.4.0 (GitHubImageSync-Android)")
+        client.newCall(builder.build()).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("LFS object download failed (${response.code})")
+            }
+            val body = response.body ?: throw IOException("Empty LFS body")
+            body.byteStream().use { input ->
+                java.io.FileOutputStream(dest).use { output ->
+                    input.copyTo(output, bufferSize = 64 * 1024)
+                }
+            }
         }
     }
 

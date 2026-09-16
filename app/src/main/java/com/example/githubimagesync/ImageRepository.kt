@@ -119,6 +119,31 @@ class ImageRepository(private val context: Context) {
         subFolder: String,
         isVideo: Boolean
     ): Uri? = withContext(Dispatchers.IO) {
+        saveMediaToGalleryStreaming(fileName, subFolder, isVideo) { out ->
+            out.write(bytes)
+        }
+    }
+
+    /** Streams [source] into the gallery without loading the whole file into RAM. */
+    suspend fun saveMediaToGalleryFromFile(
+        fileName: String,
+        source: File,
+        subFolder: String,
+        isVideo: Boolean
+    ): Uri? = withContext(Dispatchers.IO) {
+        saveMediaToGalleryStreaming(fileName, subFolder, isVideo) { out ->
+            FileInputStream(source).use { input ->
+                input.copyTo(out, bufferSize = 64 * 1024)
+            }
+        }
+    }
+
+    private fun saveMediaToGalleryStreaming(
+        fileName: String,
+        subFolder: String,
+        isVideo: Boolean,
+        write: (java.io.OutputStream) -> Unit
+    ): Uri? {
         val baseDir = if (isVideo) Environment.DIRECTORY_MOVIES else Environment.DIRECTORY_PICTURES
         val relativePath = "$baseDir/GitHubSync/$subFolder"
         val mime = guessMime(fileName, isVideo)
@@ -142,9 +167,9 @@ class ImageRepository(private val context: Context) {
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
             }
-            val uri = context.contentResolver.insert(collection, values) ?: return@withContext null
+            val uri = context.contentResolver.insert(collection, values) ?: return null
             try {
-                context.contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                context.contentResolver.openOutputStream(uri)?.use { write(it) }
                 values.clear()
                 if (isVideo) {
                     values.put(MediaStore.Video.Media.IS_PENDING, 0)
@@ -165,7 +190,7 @@ class ImageRepository(private val context: Context) {
             )
             if (!dir.exists()) dir.mkdirs()
             val file = File(dir, fileName)
-            FileOutputStream(file).use { it.write(bytes) }
+            FileOutputStream(file).use { write(it) }
             val values = ContentValues().apply {
                 if (isVideo) {
                     put(MediaStore.Video.Media.DATA, file.absolutePath)
@@ -482,7 +507,10 @@ class ImageRepository(private val context: Context) {
         var success = 0
         var skipped = 0
         var failed = 0
+        val tempDir = context.cacheDir
         for ((index, item) in files.withIndex()) {
+            var downloadFile: File? = null
+            var plainFile: File? = null
             try {
                 onProgress("[${index + 1}/${files.size}] ${item.path}")
                 if (item.name in localNames) {
@@ -492,26 +520,40 @@ class ImageRepository(private val context: Context) {
                 }
                 val url = item.downloadUrl
                     ?: throw IllegalStateException("No download_url for ${item.path}")
-                var bytes = client.downloadMedia(url, onProgress)
-                if (decrypt) {
+
+                // Stream to disk (LFS-safe) – never load multi-hundred-MB bodies into RAM
+                downloadFile = File.createTempFile("gis_dl_", ".tmp", tempDir)
+                onProgress("  downloading …")
+                client.downloadMediaToFile(url, downloadFile, onProgress)
+
+                val toSave: File = if (decrypt) {
                     onProgress("  decrypting …")
+                    plainFile = File.createTempFile("gis_plain_", ".tmp", tempDir)
                     try {
-                        bytes = CryptoHelper.decrypt(bytes, encryptionPassword)
+                        CryptoHelper.decryptToFile(downloadFile, plainFile, encryptionPassword)
                     } catch (e: Exception) {
                         throw IllegalStateException(
                             "Decrypt failed (wrong password or not encrypted?): ${e.message}"
                         )
                     }
+                    plainFile
+                } else {
+                    downloadFile
                 }
+
                 val video = isVideoName(item.name)
-                saveMediaToGallery(item.name, bytes, codename, isVideo = video)
+                val kb = toSave.length() / 1024
+                saveMediaToGalleryFromFile(item.name, toSave, codename, isVideo = video)
                 localNames.add(item.name)
                 success++
-                onProgress("  saved (${bytes.size / 1024} KB)")
+                onProgress("  saved ($kb KB)")
             } catch (e: Exception) {
                 failed++
                 Log.e(tag, "Download failed for ${item.name}", e)
                 onProgress("  FAILED: ${e.message}")
+            } finally {
+                downloadFile?.delete()
+                plainFile?.delete()
             }
         }
         return SyncResult(success, skipped, failed)
