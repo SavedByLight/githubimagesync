@@ -4,6 +4,7 @@
     <string name="github_owner_hint">GitHub username / org</string>
     <string name="github_repo_hint">Repository name</string>
     <string name="github_token_hint">Personal Access Token (repo scope)</string>
+    <string name="encryption_password_hint">Encryption password (optional)</string>
     <string name="save_settings">Save Settings</string>
     <string name="sync_button">Sync (Download)</string>
     <string name="upload_button">Upload</string>

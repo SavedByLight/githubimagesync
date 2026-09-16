@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
         binding.editOwner.setText(prefs.owner)
         binding.editRepo.setText(prefs.repo)
         binding.editToken.setText(prefs.token)
+        binding.editEncPassword.setText(prefs.encryptionPassword)
 
         binding.btnSaveSettings.setOnClickListener { saveSettings() }
         binding.btnSync.setOnClickListener { startSyncDownload() }
@@ -60,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         val owner = binding.editOwner.text?.toString()?.trim().orEmpty()
         val repo = binding.editRepo.text?.toString()?.trim().orEmpty()
         val token = binding.editToken.text?.toString()?.trim().orEmpty()
+        val encPassword = binding.editEncPassword.text?.toString().orEmpty()
 
         if (owner.isBlank() || repo.isBlank() || token.isBlank()) {
             Toast.makeText(this, R.string.missing_config, Toast.LENGTH_SHORT).show()
@@ -68,8 +70,10 @@ class MainActivity : AppCompatActivity() {
         prefs.owner = owner
         prefs.repo = repo
         prefs.token = token
+        prefs.encryptionPassword = encPassword
         Toast.makeText(this, R.string.settings_saved, Toast.LENGTH_SHORT).show()
-        appendLog("Settings saved for $owner/$repo")
+        val encNote = if (CryptoHelper.isEncryptionEnabled(encPassword)) " (encryption ON)" else " (encryption OFF)"
+        appendLog("Settings saved for $owner/$repo$encNote")
     }
 
     private fun ensureStoragePermission(): Boolean {
@@ -107,6 +111,8 @@ class MainActivity : AppCompatActivity() {
             prefs.repo = repo
             prefs.token = token
         }
+        // Always pick up latest encryption password from the field (may not have been saved)
+        prefs.encryptionPassword = binding.editEncPassword.text?.toString().orEmpty()
         return GitHubClient(prefs.owner, prefs.repo, prefs.token)
     }
 
@@ -136,7 +142,10 @@ class MainActivity : AppCompatActivity() {
         appendLog("── Sync (Download) started ──")
         lifecycleScope.launch {
             try {
-                val result = imageRepo.syncDownload(client) { msg ->
+                val result = imageRepo.syncDownload(
+                    client,
+                    encryptionPassword = prefs.encryptionPassword
+                ) { msg ->
                     appendLog(msg)
                 }
                 appendLog(
@@ -165,7 +174,10 @@ class MainActivity : AppCompatActivity() {
         appendLog("── Upload started ──")
         lifecycleScope.launch {
             try {
-                val result = imageRepo.uploadAll(client) { msg ->
+                val result = imageRepo.uploadAll(
+                    client,
+                    encryptionPassword = prefs.encryptionPassword
+                ) { msg ->
                     appendLog(msg)
                 }
                 appendLog(

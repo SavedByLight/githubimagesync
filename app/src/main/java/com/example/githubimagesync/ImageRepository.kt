@@ -13,6 +13,7 @@ import com.example.githubimagesync.github.GitHubClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.text.SimpleDateFormat
@@ -204,6 +205,7 @@ class ImageRepository(private val context: Context) {
 
     suspend fun uploadAll(
         client: GitHubClient,
+        encryptionPassword: String = "",
         onProgress: (String) -> Unit
     ): SyncResult {
         val codename = deviceCodename()
@@ -211,7 +213,9 @@ class ImageRepository(private val context: Context) {
         val media = loadLocalMedia()
         val images = media.count { !it.isVideo }
         val videos = media.count { it.isVideo }
+        val encrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
         onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
+        if (encrypt) onProgress("Encryption is ON (AES-256-GCM)")
 
         val remoteNames = try {
             client.listDirectory(folder)
@@ -229,6 +233,7 @@ class ImageRepository(private val context: Context) {
         var failed = 0
         val timestamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
         var lfsReady = false
+        val tempDir = context.cacheDir
 
         for ((index, item) in media.withIndex()) {
             val kind = if (item.isVideo) "video" else "image"
@@ -241,7 +246,7 @@ class ImageRepository(private val context: Context) {
                     continue
                 }
 
-                val size = if (item.size > 0) item.size else {
+                val plainSize = if (item.size > 0) item.size else {
                     openMediaStream(item.uri).use { stream ->
                         var total = 0L
                         val buf = ByteArray(64 * 1024)
@@ -254,39 +259,81 @@ class ImageRepository(private val context: Context) {
                     }
                 }
 
-                if (size <= 0L) {
+                if (plainSize <= 0L) {
                     skipped++
                     onProgress("  skipped (empty)")
                     continue
                 }
 
                 val remotePath = "$folder/${item.displayName}"
-                val message = "Upload ${item.displayName} ($kind) from $codename ($timestamp)"
+                val message = "Upload ${item.displayName} ($kind) from $codename ($timestamp)" +
+                    if (encrypt) " [encrypted]" else ""
 
-                if (size >= GitHubClient.CONTENTS_MAX_BYTES) {
-                    if (!lfsReady) {
-                        onProgress("  ensuring .gitattributes (LFS) …")
-                        client.ensureLfsAttributes()
-                        lfsReady = true
+                if (encrypt) {
+                    // Encrypt to temp file (works for both small and large)
+                    onProgress("  encrypting …")
+                    val encFile = CryptoHelper.encryptToTempFile(
+                        openPlainStream = { openMediaStream(item.uri) },
+                        password = encryptionPassword,
+                        tempDir = tempDir
+                    ) ?: throw IllegalStateException("Encryption produced no file")
+                    try {
+                        val encSize = encFile.length()
+                        if (encSize >= GitHubClient.CONTENTS_MAX_BYTES) {
+                            if (!lfsReady) {
+                                onProgress("  ensuring .gitattributes (LFS) …")
+                                client.ensureLfsAttributes()
+                                lfsReady = true
+                            }
+                            val mb = encSize / (1024.0 * 1024.0)
+                            onProgress("  using Git LFS (%.1f MB encrypted)".format(mb))
+                            client.uploadLargeFile(
+                                path = remotePath,
+                                sizeBytes = encSize,
+                                openStream = { FileInputStream(encFile) },
+                                commitMessage = "$message [LFS]",
+                                onProgress = onProgress
+                            )
+                        } else {
+                            onProgress("  uploading via Contents API (${encSize / 1024} KB encrypted) …")
+                            val bytes = encFile.readBytes()
+                            client.uploadFile(
+                                path = remotePath,
+                                contentBytes = bytes,
+                                commitMessage = message,
+                                existingSha = null
+                            )
+                        }
+                    } finally {
+                        encFile.delete()
                     }
-                    val mb = size / (1024.0 * 1024.0)
-                    onProgress("  using Git LFS (%.1f MB)".format(mb))
-                    client.uploadLargeFile(
-                        path = remotePath,
-                        sizeBytes = size,
-                        openStream = { openMediaStream(item.uri) },
-                        commitMessage = "$message [LFS]",
-                        onProgress = onProgress
-                    )
                 } else {
-                    onProgress("  uploading via Contents API (${size / 1024} KB) …")
-                    val bytes = readMediaBytes(item.uri)
-                    client.uploadFile(
-                        path = remotePath,
-                        contentBytes = bytes,
-                        commitMessage = message,
-                        existingSha = null
-                    )
+                    // Plaintext path (original behaviour)
+                    if (plainSize >= GitHubClient.CONTENTS_MAX_BYTES) {
+                        if (!lfsReady) {
+                            onProgress("  ensuring .gitattributes (LFS) …")
+                            client.ensureLfsAttributes()
+                            lfsReady = true
+                        }
+                        val mb = plainSize / (1024.0 * 1024.0)
+                        onProgress("  using Git LFS (%.1f MB)".format(mb))
+                        client.uploadLargeFile(
+                            path = remotePath,
+                            sizeBytes = plainSize,
+                            openStream = { openMediaStream(item.uri) },
+                            commitMessage = "$message [LFS]",
+                            onProgress = onProgress
+                        )
+                    } else {
+                        onProgress("  uploading via Contents API (${plainSize / 1024} KB) …")
+                        val bytes = readMediaBytes(item.uri)
+                        client.uploadFile(
+                            path = remotePath,
+                            contentBytes = bytes,
+                            commitMessage = message,
+                            existingSha = null
+                        )
+                    }
                 }
                 success++
                 onProgress("  OK ($kind)")
@@ -301,10 +348,13 @@ class ImageRepository(private val context: Context) {
 
     suspend fun syncDownload(
         client: GitHubClient,
+        encryptionPassword: String = "",
         onProgress: (String) -> Unit
     ): SyncResult {
         val codename = deviceCodename()
+        val decrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
         onProgress("Listing /$codename on GitHub …")
+        if (decrypt) onProgress("Decryption is ON (AES-256-GCM)")
         val items: List<ContentItem> = client.listDirectory(codename)
         val files = items.filter { it.type == "file" && isMediaName(it.name) }
 
@@ -329,7 +379,18 @@ class ImageRepository(private val context: Context) {
                 }
                 val url = item.downloadUrl
                     ?: throw IllegalStateException("No download_url for ${item.path}")
-                val bytes = client.downloadMedia(url, onProgress)
+                var bytes = client.downloadMedia(url, onProgress)
+                if (decrypt) {
+                    onProgress("  decrypting …")
+                    try {
+                        bytes = CryptoHelper.decrypt(bytes, encryptionPassword)
+                    } catch (e: Exception) {
+                        // Wrong password or file was uploaded without encryption
+                        throw IllegalStateException(
+                            "Decrypt failed (wrong password or not encrypted?): ${e.message}"
+                        )
+                    }
+                }
                 val video = isVideoName(item.name)
                 saveMediaToGallery(item.name, bytes, codename, isVideo = video)
                 success++

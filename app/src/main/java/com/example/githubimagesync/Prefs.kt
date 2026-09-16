@@ -19,6 +19,11 @@ class Prefs(context: Context) {
         get() = prefs.getString(KEY_TOKEN, "") ?: ""
         set(value) = prefs.edit().putString(KEY_TOKEN, value.trim()).apply()
 
+    /** Optional password used to encrypt media before upload / decrypt on download. */
+    var encryptionPassword: String
+        get() = prefs.getString(KEY_ENC_PASSWORD, "") ?: ""
+        set(value) = prefs.edit().putString(KEY_ENC_PASSWORD, value).apply()
+
     fun isConfigured(): Boolean =
         owner.isNotBlank() && repo.isNotBlank() && token.isNotBlank()
 
@@ -26,5 +31,6 @@ class Prefs(context: Context) {
         private const val KEY_OWNER = "owner"
         private const val KEY_REPO = "repo"
         private const val KEY_TOKEN = "token"
+        private const val KEY_ENC_PASSWORD = "enc_password"
     }
 }
