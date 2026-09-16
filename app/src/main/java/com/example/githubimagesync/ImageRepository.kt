@@ -464,15 +464,20 @@ class ImageRepository(private val context: Context) {
         if (decrypt) onProgress("Decryption is ON (AES-256-CTR + HMAC)")
 
         val inventory = loadRemoteInventory(client, codename, onProgress)
+        // One entry per filename – never download the same name twice
         val files = inventory.files
+            .distinctBy { it.name }
+            .sortedBy { it.path }
 
         if (files.isEmpty()) {
             onProgress("No media files found under /$codename")
             return SyncResult(0, 0, 0)
         }
-        onProgress("Found ${files.size} remote media file(s). Checking local library …")
+        onProgress("Found ${files.size} unique remote media file(s). Checking local library …")
 
-        val localNames = loadLocalMedia().map { it.displayName }.toSet()
+        // Mutable so we skip names we just saved in this run
+        val localNames = loadLocalMedia().map { it.displayName }.toMutableSet()
+        onProgress("${localNames.size} local media name(s) – those will be skipped")
 
         var success = 0
         var skipped = 0
@@ -500,6 +505,7 @@ class ImageRepository(private val context: Context) {
                 }
                 val video = isVideoName(item.name)
                 saveMediaToGallery(item.name, bytes, codename, isVideo = video)
+                localNames.add(item.name)
                 success++
                 onProgress("  saved (${bytes.size / 1024} KB)")
             } catch (e: Exception) {

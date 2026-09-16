@@ -47,9 +47,13 @@
             </intent-filter>
         </activity>
 
-        <!-- Continues uploads after the UI is closed -->
+        <!-- Continues uploads / downloads after the UI is closed -->
         <service
             android:name=".UploadForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+        <service
+            android:name=".DownloadForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 

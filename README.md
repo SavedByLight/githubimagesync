@@ -2,17 +2,18 @@
 
 A simple Android app that keeps photos in sync between your phone and a GitHub repository.
 
-- **Upload** – takes the photos currently on the device and pushes them into a folder named after the **device codename** (`Build.DEVICE`, e.g. `raven`, `cheetah`, `oriole`).
-- **Sync (Download)** – pulls every image that already exists in that same device-codename folder on GitHub and saves them into the phone’s gallery under `Pictures/GitHubSync/<codename>/`.
+- **Upload** – pushes device photos into `/<device-codename>/p1`, `p2`, … (1000 files per part folder). Already-uploaded names across all parts are skipped.
+- **Sync (Download)** – pulls every image from all part folders under the device codename and saves them into the gallery under `Pictures/GitHubSync/<codename>/`.
 
 ## Features
 
 - Material 3 UI with owner / repo / token fields
 - **Optional AES-256-CTR + HMAC-SHA256 encryption** of media before upload (and automatic decryption on download)
+- **Background upload & download** – foreground services keep transferring after you close the app (progress notification + Stop action)
+- Downloads **skip filenames already on the device** (no local duplicates)
 - Device codename shown on the main screen (the exact folder name used on GitHub)
 - Progress log while uploading or downloading
 - Works with Android 8+ (API 26); uses the modern `READ_MEDIA_IMAGES` permission on Android 13+
-- Overwrites existing files on GitHub when the same file name is uploaded again
 - Skips empty files; large files use Git LFS
 
 ## Setup
@@ -43,20 +44,30 @@ Create an empty public or private repository that will hold the photos.
 2. (Optional) Enter an **Encryption password**. When set, every uploaded photo/video is encrypted with AES-256-CTR + HMAC-SHA256 before it leaves the device. The same password is required to decrypt files on download. Leave blank for normal (plaintext) behaviour.
 3. Tap **Save Settings**.
 4. Grant the storage / media permission when asked.
-5. Tap **Upload** to push local photos into `/<device-codename>/` on the repo.
-6. Tap **Sync (Download)** to pull the photos that already live in that folder back onto the phone (and decrypt them if a password is set).
+5. Tap **Upload** to push local photos into `/<device-codename>/p1`, `p2`, ….  
+   Runs in a **foreground service** – you can leave the app; a notification shows progress and a **Stop** action.
+6. Tap **Sync (Download)** to pull photos from all part folders (decrypts if a password is set).  
+   Also runs in the background. Filenames already present on the device are **skipped**.
 
 ## How the folder structure looks on GitHub
 
+Files are split into **part folders** of at most **1000 files** each (GitHub’s Contents API listing limit):
+
 ```
 your-repo/
-└── raven/                 ← device codename (example)
-    ├── IMG_20240101_120000.jpg
-    ├── Screenshot_2024.png
-    └── ...
+└── frankel/                 ← device codename (example)
+    ├── p1/                  ← first 1000 files
+    │   ├── IMG_001.jpg
+    │   └── …
+    ├── p2/                  ← next 1000 files
+    │   └── …
+    └── p3/
+        └── …
 ```
 
-Each physical device writes into its own folder, so you can keep photos from several phones in the same repository without collisions.
+- Before every upload the app **scans all part folders** (and any legacy flat files under the codename) and **skips any name that already exists** — no duplicates.
+- New files go into the lowest-numbered part that still has room (`p1`, then `p2`, …).
+- Each physical device uses its own codename root, so several phones can share one repo without collisions.
 
 ## Important notes / limitations
 
@@ -75,7 +86,9 @@ Each physical device writes into its own folder, so you can keep photos from sev
 app/
 ├── src/main/
 │   ├── java/com/example/githubimagesync/
-│   │   ├── MainActivity.kt          # UI + permission + button handlers
+│   │   ├── MainActivity.kt            # UI + permission + button handlers
+│   │   ├── UploadForegroundService.kt # Background upload
+│   │   ├── DownloadForegroundService.kt # Background download
 │   │   ├── Prefs.kt                 # Simple SharedPreferences helper
 │   │   ├── CryptoHelper.kt          # AES-256-CTR + HMAC-SHA256 encrypt / decrypt
 │   │   ├── ImageRepository.kt       # MediaStore query, gallery save, high-level sync
