@@ -203,35 +203,123 @@ class ImageRepository(private val context: Context) {
         }
     }
 
+    /**
+     * Max files per part folder (GitHub Contents API lists at most ~1000 entries).
+     * Layout: `<codename>/p1/…`, `<codename>/p2/…`, …
+     */
+    companion object {
+        const val FILES_PER_PART = 1000
+        private val PART_DIR_REGEX = Regex("^p(\\d+)$", RegexOption.IGNORE_CASE)
+    }
+
+    /**
+     * Inventory of everything under `/<codename>/`:
+     * - part folders `p1`, `p2`, …
+     * - legacy flat files directly under the codename (pre-partition layout)
+     */
+    private data class RemoteInventory(
+        /** File names already present anywhere under the device folder (no dupes). */
+        val names: MutableSet<String>,
+        /** part number → current file count in that part folder */
+        val partCounts: MutableMap<Int, Int>,
+        /** All remote media items (for download). */
+        val files: MutableList<ContentItem>
+    )
+
+    private suspend fun loadRemoteInventory(
+        client: GitHubClient,
+        codename: String,
+        onProgress: (String) -> Unit
+    ): RemoteInventory {
+        val names = mutableSetOf<String>()
+        val partCounts = mutableMapOf<Int, Int>()
+        val files = mutableListOf<ContentItem>()
+
+        onProgress("Scanning /$codename (all part folders) …")
+        val top = try {
+            client.listDirectory(codename)
+        } catch (e: Exception) {
+            onProgress("Could not list /$codename: ${e.message}")
+            return RemoteInventory(names, partCounts, files)
+        }
+
+        // Legacy flat files directly under the codename folder
+        for (item in top.filter { it.type == "file" }) {
+            names.add(item.name)
+            if (isMediaName(item.name)) files.add(item)
+        }
+        if (top.any { it.type == "file" }) {
+            onProgress("  legacy flat files: ${top.count { it.type == "file" }}")
+        }
+
+        // Part folders: p1, p2, …
+        val partDirs = top.filter { it.type == "dir" && PART_DIR_REGEX.matches(it.name) }
+            .mapNotNull { dir ->
+                val n = PART_DIR_REGEX.matchEntire(dir.name)?.groupValues?.get(1)?.toIntOrNull()
+                n?.let { it to dir.name }
+            }
+            .sortedBy { it.first }
+
+        for ((partNum, dirName) in partDirs) {
+            val path = "$codename/$dirName"
+            try {
+                val entries = client.listDirectory(path).filter { it.type == "file" }
+                partCounts[partNum] = entries.size
+                for (f in entries) {
+                    names.add(f.name)
+                    if (isMediaName(f.name)) files.add(f)
+                }
+                onProgress("  /$path → ${entries.size} file(s)")
+                if (entries.size >= FILES_PER_PART) {
+                    onProgress("    (at capacity – new uploads will use the next part)")
+                }
+            } catch (e: Exception) {
+                onProgress("  Could not list /$path: ${e.message}")
+            }
+        }
+
+        if (partDirs.isEmpty() && top.none { it.type == "file" }) {
+            onProgress("  (empty – will create /$codename/p1)")
+        }
+        onProgress("Total unique remote names: ${names.size}")
+        return RemoteInventory(names, partCounts, files)
+    }
+
+    /** Choose part folder for the next new file: fill lowest incomplete part, else open a new one. */
+    private fun allocatePartFolder(partCounts: MutableMap<Int, Int>): String {
+        if (partCounts.isEmpty()) {
+            partCounts[1] = 0
+            return "p1"
+        }
+        // Prefer the smallest part number that still has room
+        val open = partCounts.entries
+            .filter { it.value < FILES_PER_PART }
+            .minByOrNull { it.key }
+        if (open != null) {
+            return "p${open.key}"
+        }
+        val next = (partCounts.keys.maxOrNull() ?: 0) + 1
+        partCounts[next] = 0
+        return "p$next"
+    }
+
     suspend fun uploadAll(
         client: GitHubClient,
         encryptionPassword: String = "",
         onProgress: (String) -> Unit
     ): SyncResult {
         val codename = deviceCodename()
-        val folder = codename
         val media = loadLocalMedia()
         val images = media.count { !it.isVideo }
         val videos = media.count { it.isVideo }
         val encrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
-        onProgress("Found $images image(s) + $videos video(s). Checking /$folder …")
+        onProgress("Found $images image(s) + $videos video(s)")
         if (encrypt) onProgress("Encryption is ON (AES-256-CTR + HMAC)")
 
-        // Mutable so we can add names as we upload (avoids re-uploading in the same run)
-        val remoteNames = mutableSetOf<String>()
-        try {
-            val listed = client.listDirectory(folder)
-                .filter { it.type == "file" }
-                .map { it.name }
-            remoteNames.addAll(listed)
-            onProgress("${remoteNames.size} file(s) already on GitHub – those will be skipped")
-            if (listed.size >= 1000) {
-                onProgress("  (directory listing may be truncated at 1000; will verify each file individually)")
-            }
-        } catch (e: Exception) {
-            onProgress("Could not list remote folder: ${e.message}")
-            onProgress("  Will check each file individually before upload")
-        }
+        val inventory = loadRemoteInventory(client, codename, onProgress)
+        val remoteNames = inventory.names
+        val partCounts = inventory.partCounts
+        onProgress("${remoteNames.size} file(s) already on GitHub – duplicates will be skipped")
 
         var success = 0
         var skipped = 0
@@ -245,23 +333,7 @@ class ImageRepository(private val context: Context) {
             try {
                 onProgress("[${index + 1}/${media.size}] ${item.displayName}")
 
-                val remotePath = "$folder/${item.displayName}"
-
-                // Fast path: name was in the directory listing
-                var alreadyRemote = item.displayName in remoteNames
-                // Reliable path: if not listed (truncated / list failed), ask GitHub for this path
-                if (!alreadyRemote) {
-                    try {
-                        if (client.getFileSha(remotePath) != null) {
-                            alreadyRemote = true
-                            remoteNames.add(item.displayName)
-                        }
-                    } catch (e: Exception) {
-                        // Auth / network errors should not silently re-upload; surface them
-                        throw e
-                    }
-                }
-                if (alreadyRemote) {
+                if (item.displayName in remoteNames) {
                     skipped++
                     onProgress("  skipped (already uploaded)")
                     continue
@@ -286,11 +358,14 @@ class ImageRepository(private val context: Context) {
                     continue
                 }
 
-                val message = "Upload ${item.displayName} ($kind) from $codename ($timestamp)" +
+                val part = allocatePartFolder(partCounts)
+                val remotePath = "$codename/$part/${item.displayName}"
+                onProgress("  → /$remotePath")
+
+                val message = "Upload ${item.displayName} ($kind) from $codename/$part ($timestamp)" +
                     if (encrypt) " [encrypted]" else ""
 
                 if (encrypt) {
-                    // Encrypt to temp file (works for both small and large)
                     onProgress("  encrypting …")
                     val encFile = CryptoHelper.encryptToTempFile(
                         openPlainStream = { openMediaStream(item.uri) },
@@ -328,7 +403,6 @@ class ImageRepository(private val context: Context) {
                         encFile.delete()
                     }
                 } else {
-                    // Plaintext path (original behaviour)
                     if (plainSize >= GitHubClient.CONTENTS_MAX_BYTES) {
                         if (!lfsReady) {
                             onProgress("  ensuring .gitattributes (LFS) …")
@@ -357,9 +431,11 @@ class ImageRepository(private val context: Context) {
                 }
                 success++
                 remoteNames.add(item.displayName)
+                // Bump count for the part we just wrote into
+                val partNum = PART_DIR_REGEX.matchEntire(part)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+                partCounts[partNum] = (partCounts[partNum] ?: 0) + 1
                 onProgress("  OK ($kind)")
             } catch (e: Exception) {
-                // If GitHub says the file already exists (race / truncated list), count as skipped
                 val msg = e.message.orEmpty()
                 if (msg.contains("sha wasn't supplied", ignoreCase = true) ||
                     msg.contains("already exists", ignoreCase = true) ||
@@ -385,13 +461,13 @@ class ImageRepository(private val context: Context) {
     ): SyncResult {
         val codename = deviceCodename()
         val decrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
-        onProgress("Listing /$codename on GitHub …")
         if (decrypt) onProgress("Decryption is ON (AES-256-CTR + HMAC)")
-        val items: List<ContentItem> = client.listDirectory(codename)
-        val files = items.filter { it.type == "file" && isMediaName(it.name) }
+
+        val inventory = loadRemoteInventory(client, codename, onProgress)
+        val files = inventory.files
 
         if (files.isEmpty()) {
-            onProgress("No media files found in /$codename")
+            onProgress("No media files found under /$codename")
             return SyncResult(0, 0, 0)
         }
         onProgress("Found ${files.size} remote media file(s). Checking local library …")
@@ -403,7 +479,7 @@ class ImageRepository(private val context: Context) {
         var failed = 0
         for ((index, item) in files.withIndex()) {
             try {
-                onProgress("[${index + 1}/${files.size}] ${item.name}")
+                onProgress("[${index + 1}/${files.size}] ${item.path}")
                 if (item.name in localNames) {
                     skipped++
                     onProgress("  skipped (already on device)")
@@ -417,7 +493,6 @@ class ImageRepository(private val context: Context) {
                     try {
                         bytes = CryptoHelper.decrypt(bytes, encryptionPassword)
                     } catch (e: Exception) {
-                        // Wrong password or file was uploaded without encryption
                         throw IllegalStateException(
                             "Decrypt failed (wrong password or not encrypted?): ${e.message}"
                         )
