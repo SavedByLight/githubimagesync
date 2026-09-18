@@ -10,10 +10,15 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.githubimagesync.databinding.ActivityMainBinding
 import com.example.githubimagesync.github.GitHubClient
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -75,6 +80,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnSaveSettings.setOnClickListener { saveSettings() }
         binding.btnSync.setOnClickListener { startSyncDownload() }
+        binding.btnDownloadOther.setOnClickListener { startDownloadFromOtherDevice() }
         binding.btnUpload.setOnClickListener { startUpload() }
 
         when {
@@ -167,6 +173,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun setBusy(busy: Boolean) {
         binding.btnSync.isEnabled = !busy
+        binding.btnDownloadOther.isEnabled = !busy
         binding.btnUpload.isEnabled = !busy
         binding.btnSaveSettings.isEnabled = !busy
         binding.progressBar.visibility = if (busy) android.view.View.VISIBLE else android.view.View.GONE
@@ -185,6 +192,7 @@ class MainActivity : AppCompatActivity() {
     /**
      * Starts a foreground service so download continues after the app is closed.
      * Duplicates (same filename already on the device) are skipped.
+     * Downloads from this device's own codename folder.
      */
     private fun startSyncDownload() {
         if (anyServiceRunning()) {
@@ -203,7 +211,77 @@ class MainActivity : AppCompatActivity() {
         appendLog("── Sync (Download) started (background) ──")
         appendLog("You can close the app – download will continue.")
         Toast.makeText(this, "Download running in background", Toast.LENGTH_SHORT).show()
-        DownloadForegroundService.start(this)
+        DownloadForegroundService.start(this, targetCodename = null)
+    }
+
+    /**
+     * Lists other device folders in the repo and lets the user pick one to download from.
+     */
+    private fun startDownloadFromOtherDevice() {
+        if (anyServiceRunning()) {
+            Toast.makeText(
+                this,
+                if (UploadForegroundService.isRunning) "Upload is running – wait or stop it first"
+                else "Download already running in background",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        if (!ensureStoragePermission()) return
+        val client = requireConfig() ?: return
+
+        setBusy(true)
+        appendLog(getString(R.string.listing_devices))
+        lifecycleScope.launch {
+            val folders = try {
+                withContext(Dispatchers.IO) {
+                    imageRepo.listDeviceFolders(client) { msg ->
+                        runOnUiThread { appendLog(msg) }
+                    }
+                }
+            } catch (e: Exception) {
+                appendLog("ERROR listing devices: ${e.message}")
+                setBusy(false)
+                Toast.makeText(this@MainActivity, "Failed to list devices: ${e.message}", Toast.LENGTH_LONG).show()
+                return@launch
+            }
+
+            val own = imageRepo.deviceCodename()
+            // Prefer showing other devices first; still allow picking own if desired
+            val choices = folders.sortedWith(
+                compareBy<String> { it.equals(own, ignoreCase = true) }.thenBy { it }
+            )
+
+            if (choices.isEmpty()) {
+                appendLog(getString(R.string.no_other_devices))
+                setBusy(false)
+                Toast.makeText(this@MainActivity, R.string.no_other_devices, Toast.LENGTH_LONG).show()
+                return@launch
+            }
+
+            setBusy(false)
+            val labels = choices.map { name ->
+                if (name.equals(own, ignoreCase = true)) "$name (this device)" else name
+            }.toTypedArray()
+
+            AlertDialog.Builder(this@MainActivity)
+                .setTitle(R.string.choose_device_title)
+                .setItems(labels) { _, which ->
+                    val selected = choices[which]
+                    setBusy(true)
+                    appendLog("── Download from /$selected started (background) ──")
+                    appendLog("You can close the app – download will continue.")
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Downloading from /$selected …",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    DownloadForegroundService.start(this@MainActivity, targetCodename = selected)
+                }
+                .setOnCancelListener { setBusy(false) }
+                .setNegativeButton(android.R.string.cancel) { _, _ -> setBusy(false) }
+                .show()
+        }
     }
 
     private fun startUpload() {

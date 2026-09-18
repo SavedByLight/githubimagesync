@@ -2,15 +2,18 @@
 
 A simple Android app that keeps photos in sync between your phone and a GitHub repository.
 
-- **Upload** – pushes device photos into `/<device-codename>/p1`, `p2`, … (1000 files per part folder). Already-uploaded names across all parts are skipped.
-- **Sync (Download)** – pulls every image from all part folders under the device codename and saves them into the gallery under `Pictures/GitHubSync/<codename>/`.
+- **Upload** – pushes device photos into `/<device-codename>/p1`, `p2`, … (1000 files per part folder). Names that already exist under **any** device folder in the repo are skipped (no re-upload of the same picture/video from another phone).
+- **Sync (Download)** – pulls every image from all part folders under the **current** device codename and saves them into the gallery under `Pictures/GitHubSync/<codename>/`.
+- **Download from other device** – manually choose any other device folder in the repo and download its photos/videos (local duplicates by filename are still skipped).
 
 ## Features
 
 - Material 3 UI with owner / repo / token fields
 - **Optional AES-256-CTR + HMAC-SHA256 encryption** of media before upload (and automatic decryption on download)
 - **Background upload & download** – foreground services keep transferring after you close the app (progress notification + Stop action)
+- Uploads **skip filenames that already exist under any device** (cross-device deduplication)
 - Downloads **skip filenames already on the device** (no local duplicates)
+- **Manual download from other devices** via a device-folder picker
 - Device codename shown on the main screen (the exact folder name used on GitHub)
 - Progress log while uploading or downloading
 - Works with Android 8+ (API 26); uses the modern `READ_MEDIA_IMAGES` permission on Android 13+
@@ -45,9 +48,11 @@ Create an empty public or private repository that will hold the photos.
 3. Tap **Save Settings**.
 4. Grant the storage / media permission when asked.
 5. Tap **Upload** to push local photos into `/<device-codename>/p1`, `p2`, ….  
-   Runs in a **foreground service** – you can leave the app; a notification shows progress and a **Stop** action.
-6. Tap **Sync (Download)** to pull photos from all part folders (decrypts if a password is set).  
+   Runs in a **foreground service** – you can leave the app; a notification shows progress and a **Stop** action.  
+   Filenames that already exist under **any** device folder are skipped.
+6. Tap **Sync (Download)** to pull photos from **this device’s** part folders (decrypts if a password is set).  
    Also runs in the background. Filenames already present on the device are **skipped**.
+7. Tap **Download from other device…** to list every device folder in the repo, pick one, and download its media into the gallery under `Pictures/GitHubSync/<that-codename>/`.
 
 ## How the folder structure looks on GitHub
 
@@ -65,9 +70,10 @@ your-repo/
         └── …
 ```
 
-- Before every upload the app **scans all part folders** (and any legacy flat files under the codename) and **skips any name that already exists** — no duplicates.
-- New files go into the lowest-numbered part that still has room (`p1`, then `p2`, …).
-- Each physical device uses its own codename root, so several phones can share one repo without collisions.
+- Before every upload the app **scans every device folder** in the repo (all part folders and legacy flat files) and **skips any name that already exists anywhere** — so the same photo/video is not uploaded again from a second device.
+- New files go into the lowest-numbered part that still has room under **this** device’s codename (`p1`, then `p2`, …).
+- Each physical device uses its own codename root, so several phones can share one repo without path collisions, while filename-based deduplication prevents duplicate content.
+- Use **Download from other device…** to pull media from another phone’s folder into this device’s gallery.
 
 ## Important notes / limitations
 

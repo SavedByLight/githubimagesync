@@ -44,6 +44,7 @@ class DownloadForegroundService : Service() {
                     Log.i(TAG, "Download already running – ignoring new start request")
                     return START_STICKY
                 }
+                targetCodename = intent?.getStringExtra(EXTRA_CODENAME)
                 startForegroundWithNotification("Preparing download…")
                 downloadJob = scope.launch { runDownload() }
             }
@@ -66,9 +67,12 @@ class DownloadForegroundService : Service() {
         sendStatusBroadcast("Download cancelled")
     }
 
+    private var targetCodename: String? = null
+
     private suspend fun runDownload() {
         isRunning = true
-        sendStatusBroadcast("── Sync (Download) started (background) ──")
+        val fromLabel = targetCodename?.let { "from /$it" } ?: "from this device"
+        sendStatusBroadcast("── Sync (Download) started (background) $fromLabel ──")
         try {
             val prefs = Prefs(this)
             if (!prefs.isConfigured()) {
@@ -80,7 +84,8 @@ class DownloadForegroundService : Service() {
 
             val result = imageRepo.syncDownload(
                 client = client,
-                encryptionPassword = prefs.encryptionPassword
+                encryptionPassword = prefs.encryptionPassword,
+                targetCodename = targetCodename
             ) { msg ->
                 updateNotification(msg)
                 sendStatusBroadcast(msg)
@@ -219,13 +224,22 @@ class DownloadForegroundService : Service() {
         private const val NOTIFICATION_ID_DONE = 1004
 
         const val ACTION_STOP = "com.example.githubimagesync.STOP_DOWNLOAD"
+        const val EXTRA_CODENAME = "extra_codename"
 
         @Volatile
         var isRunning: Boolean = false
             private set
 
-        fun start(context: Context) {
-            val intent = Intent(context, DownloadForegroundService::class.java)
+        /**
+         * @param targetCodename optional device folder to download from.
+         *                       Null / blank = this device's own codename.
+         */
+        fun start(context: Context, targetCodename: String? = null) {
+            val intent = Intent(context, DownloadForegroundService::class.java).apply {
+                if (!targetCodename.isNullOrBlank()) {
+                    putExtra(EXTRA_CODENAME, targetCodename)
+                }
+            }
             androidx.core.content.ContextCompat.startForegroundService(context, intent)
         }
 

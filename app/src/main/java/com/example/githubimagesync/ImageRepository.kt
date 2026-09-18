@@ -251,6 +251,57 @@ class ImageRepository(private val context: Context) {
         val files: MutableList<ContentItem>
     )
 
+    /**
+     * Lists top-level device folders in the repo root (directories only).
+     * Skips known non-device entries such as `.gitattributes`.
+     */
+    suspend fun listDeviceFolders(
+        client: GitHubClient,
+        onProgress: (String) -> Unit = {}
+    ): List<String> = withContext(Dispatchers.IO) {
+        onProgress("Listing device folders in repo root …")
+        val root = try {
+            client.listDirectory("")
+        } catch (e: Exception) {
+            onProgress("Could not list repo root: ${e.message}")
+            return@withContext emptyList()
+        }
+        val folders = root
+            .filter { it.type == "dir" }
+            .map { it.name }
+            .filter { name ->
+                // Exclude common non-device entries
+                name != ".git" && !name.startsWith(".")
+            }
+            .sorted()
+        onProgress("Found ${folders.size} device folder(s): ${folders.joinToString()}")
+        folders
+    }
+
+    /**
+     * Collects every media filename that already exists under *any* device folder
+     * in the repository. Used by upload so the same photo/video is not re-uploaded
+     * from a second device.
+     */
+    private suspend fun loadAllRemoteNames(
+        client: GitHubClient,
+        onProgress: (String) -> Unit
+    ): Set<String> {
+        val allNames = mutableSetOf<String>()
+        val devices = listDeviceFolders(client, onProgress)
+        if (devices.isEmpty()) {
+            onProgress("No device folders yet – nothing to skip")
+            return allNames
+        }
+        for (device in devices) {
+            onProgress("Scanning names under /$device …")
+            val inv = loadRemoteInventory(client, device, onProgress)
+            allNames.addAll(inv.names)
+        }
+        onProgress("Total unique names across all devices: ${allNames.size}")
+        return allNames
+    }
+
     private suspend fun loadRemoteInventory(
         client: GitHubClient,
         codename: String,
@@ -306,7 +357,7 @@ class ImageRepository(private val context: Context) {
         if (partDirs.isEmpty() && top.none { it.type == "file" }) {
             onProgress("  (empty – will create /$codename/p1)")
         }
-        onProgress("Total unique remote names: ${names.size}")
+        onProgress("Total unique remote names under /$codename: ${names.size}")
         return RemoteInventory(names, partCounts, files)
     }
 
@@ -341,10 +392,16 @@ class ImageRepository(private val context: Context) {
         onProgress("Found $images image(s) + $videos video(s)")
         if (encrypt) onProgress("Encryption is ON (AES-256-CTR + HMAC)")
 
+        // Collect names from *all* device folders so the same photo/video is not
+        // re-uploaded when it already exists under another device.
+        val globalNames = loadAllRemoteNames(client, onProgress).toMutableSet()
+        onProgress("${globalNames.size} unique name(s) across all devices – duplicates will be skipped")
+
+        // Still need part counts / inventory for *this* device so new files land in the right pN folder.
         val inventory = loadRemoteInventory(client, codename, onProgress)
-        val remoteNames = inventory.names
         val partCounts = inventory.partCounts
-        onProgress("${remoteNames.size} file(s) already on GitHub – duplicates will be skipped")
+        // Prefer the global set for skip checks; keep local names in sync too.
+        val remoteNames = globalNames
 
         var success = 0
         var skipped = 0
@@ -479,14 +536,22 @@ class ImageRepository(private val context: Context) {
         return SyncResult(success, skipped, failed)
     }
 
+    /**
+     * Downloads media from a device folder on GitHub into the local gallery.
+     *
+     * @param targetCodename which device folder to pull from (defaults to this device).
+     *                       Pass another device's codename to download its photos/videos manually.
+     */
     suspend fun syncDownload(
         client: GitHubClient,
         encryptionPassword: String = "",
+        targetCodename: String? = null,
         onProgress: (String) -> Unit
     ): SyncResult {
-        val codename = deviceCodename()
+        val codename = targetCodename?.takeIf { it.isNotBlank() } ?: deviceCodename()
         val decrypt = CryptoHelper.isEncryptionEnabled(encryptionPassword)
         if (decrypt) onProgress("Decryption is ON (AES-256-CTR + HMAC)")
+        onProgress("Downloading from device folder: /$codename")
 
         val inventory = loadRemoteInventory(client, codename, onProgress)
         // One entry per filename – never download the same name twice
@@ -543,6 +608,7 @@ class ImageRepository(private val context: Context) {
 
                 val video = isVideoName(item.name)
                 val kb = toSave.length() / 1024
+                // Save under the source device's subfolder so gallery stays organised
                 saveMediaToGalleryFromFile(item.name, toSave, codename, isVideo = video)
                 localNames.add(item.name)
                 success++

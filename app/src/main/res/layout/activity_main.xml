@@ -124,7 +124,7 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Photos and videos upload under a folder named after this device codename. Already-uploaded files are skipped."
+            android:text="Photos and videos upload under a folder named after this device codename. Files that already exist under any device folder are skipped (no re-upload of the same name)."
             android:textSize="12sp"
             android:textColor="?android:attr/textColorSecondary" />
 
@@ -156,6 +156,16 @@
                 app:icon="@android:drawable/ic_menu_upload"
                 app:iconGravity="textStart" />
         </LinearLayout>
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/btnDownloadOther"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/download_other_button"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            app:icon="@android:drawable/stat_sys_download"
+            app:iconGravity="textStart" />
 
         <com.google.android.material.progressindicator.LinearProgressIndicator
             android:id="@+id/progressBar"
